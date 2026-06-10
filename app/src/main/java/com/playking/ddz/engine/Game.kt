@@ -189,4 +189,113 @@ class DdzGame(private val random: Random = Random.Default) {
         repeat(bombCount) { m *= 2 }
         return m
     }
+
+    // ================= 对局快照（v2：对局恢复） =================
+
+    /** 序列化当前对局（仅 BIDDING/PLAYING 有意义；FINISHED 不应存档）。 */
+    fun snapshot(): String = buildString {
+        appendLine("v=$SNAPSHOT_VERSION")
+        appendLine("phase=$phase")
+        for (i in 0..2) appendLine("hand$i=" + hands[i].joinToString(",") { it.id.toString() })
+        appendLine("bottom=" + bottom.joinToString(",") { it.id.toString() })
+        appendLine("firstBidder=$firstBidder")
+        appendLine("currentBidder=$currentBidder")
+        appendLine("highestBid=$highestBid")
+        appendLine("highestBidder=$highestBidder")
+        appendLine("bidTurns=$bidTurns")
+        appendLine("bids=" + bidHistory.joinToString(";") { "${it.first}:${it.second}" })
+        appendLine("redeal=$redealCount")
+        appendLine("landlord=$landlordSeat")
+        appendLine("current=$currentSeat")
+        appendLine("targetOwner=$targetOwner")
+        appendLine("passes=$passCountInRow")
+        appendLine("bombs=$bombCount")
+        appendLine("target=" + (currentTarget?.cards?.joinToString(",") { it.id.toString() } ?: ""))
+        appendLine("plays=" + playHistory.joinToString(";") { e ->
+            "${e.seat}:" + (e.combo?.cards?.joinToString(",") { c -> c.id.toString() } ?: "P")
+        })
+        appendLine("playsBySeat=" + playsBySeat.joinToString(","))
+    }
+
+    companion object {
+        /** 存档格式版本；不匹配的存档静默丢弃（C-03）。 */
+        const val SNAPSHOT_VERSION = 2
+
+        private fun idsToCards(s: String, deck: List<Card>): List<Card>? {
+            if (s.isEmpty()) return emptyList()
+            val out = ArrayList<Card>()
+            for (tok in s.split(",")) {
+                val id = tok.toIntOrNull() ?: return null
+                if (id !in deck.indices) return null
+                out.add(deck[id])
+            }
+            return out
+        }
+
+        /** 从快照恢复对局；格式/版本不符返回 null。 */
+        fun fromSnapshot(text: String, random: kotlin.random.Random = kotlin.random.Random.Default): DdzGame? {
+            try {
+                val map = HashMap<String, String>()
+                for (line in text.lines()) {
+                    val i = line.indexOf('=')
+                    if (i > 0) map[line.substring(0, i)] = line.substring(i + 1)
+                }
+                if (map["v"]?.toIntOrNull() != SNAPSHOT_VERSION) return null
+                val phase = Phase.valueOf(map["phase"] ?: return null)
+                if (phase != Phase.BIDDING && phase != Phase.PLAYING) return null
+                val deck = Deck.fullDeck()
+                val g = DdzGame(random)
+                g.phase = phase
+                val seen = HashSet<Int>()
+                for (i in 0..2) {
+                    val h = idsToCards(map["hand$i"] ?: return null, deck) ?: return null
+                    if (!h.all { seen.add(it.id) }) return null
+                    g.hands[i].clear(); g.hands[i].addAll(h)
+                }
+                g.bottom = idsToCards(map["bottom"] ?: return null, deck) ?: return null
+                g.firstBidder = map["firstBidder"]?.toIntOrNull() ?: return null
+                g.currentBidder = map["currentBidder"]?.toIntOrNull() ?: return null
+                g.highestBid = map["highestBid"]?.toIntOrNull() ?: return null
+                g.highestBidder = map["highestBidder"]?.toIntOrNull() ?: return null
+                g.bidTurns = map["bidTurns"]?.toIntOrNull() ?: return null
+                g.redealCount = map["redeal"]?.toIntOrNull() ?: 0
+                g.landlordSeat = map["landlord"]?.toIntOrNull() ?: return null
+                g.currentSeat = map["current"]?.toIntOrNull() ?: return null
+                g.targetOwner = map["targetOwner"]?.toIntOrNull() ?: return null
+                g.passCountInRow = map["passes"]?.toIntOrNull() ?: return null
+                g.bombCount = map["bombs"]?.toIntOrNull() ?: return null
+                (map["bids"] ?: "").takeIf { it.isNotEmpty() }?.split(";")?.forEach { tok ->
+                    val p = tok.split(":")
+                    if (p.size != 2) return null
+                    g.bidHistory.add((p[0].toIntOrNull() ?: return null) to (p[1].toIntOrNull() ?: return null))
+                }
+                val ct = map["target"] ?: ""
+                g.currentTarget = if (ct.isEmpty()) null
+                else ComboParser.parse(idsToCards(ct, deck) ?: return null) ?: return null
+                (map["plays"] ?: "").takeIf { it.isNotEmpty() }?.split(";")?.forEach { tok ->
+                    val i = tok.indexOf(':')
+                    if (i <= 0) return null
+                    val seat = tok.substring(0, i).toIntOrNull() ?: return null
+                    if (seat !in 0..2) return null
+                    val body = tok.substring(i + 1)
+                    if (body == "P") g.playHistory.add(PlayEvent(seat, null))
+                    else {
+                        val cards = idsToCards(body, deck) ?: return null
+                        val combo = ComboParser.parse(cards) ?: return null
+                        g.playHistory.add(PlayEvent(seat, combo))
+                    }
+                }
+                map["playsBySeat"]?.split(",")?.map { it.toIntOrNull() ?: return null }?.let {
+                    if (it.size != 3) return null
+                    for (i in 0..2) g.playsBySeat[i] = it[i]
+                } ?: return null
+                // 基本一致性校验
+                if (phase == Phase.PLAYING && (g.landlordSeat !in 0..2 || g.currentSeat !in 0..2)) return null
+                if (phase == Phase.BIDDING && g.currentBidder !in 0..2) return null
+                return g
+            } catch (e: Exception) {
+                return null
+            }
+        }
+    }
 }
